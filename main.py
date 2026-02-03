@@ -216,36 +216,58 @@ class DefensePipeline:
         
         print(f"  Standard Attack -> ASR Pred: {pred_attack:.2f} (Clean: {pred_clean:.2f}) | Defense Score: {score_std:.2f}")
         
-        # --- PHASE 4: Adaptive Adversarial Evaluation (The Pareto Test) ---
-        print("\n[Phase 4] Running Adaptive Attack (Defense-Aware)...")
-        # Reset Generator for fairness
-        injector = BackTimeInjector() # New random weights
+        # --- PHASE 4: The Golden Plot (Pareto Frontier) ---
+        print("\n[Phase 4] Verifying Pareto Frontier (Lambda Sweep)...")
+        
+        lambdas = [0.0, 1.0, 10.0, 100.0]
+        results = []
         
         defense_models = {'mae': self.mae, 'irm': self.irm}
-        # High penalty to force stealth
-        injector.train_attack(victim, attack_loader, epochs=100, defense_models=defense_models, lambda_defense=5.0)
         
-        # Inject Adaptive Trigger
-        adaptive_norm_tensor = injector.inject_attack(norm_clean_tensor)
-        
-        # Check ASR
-        adaptive_in = adaptive_norm_tensor[:, :, 0, 0:1]
-        pred_adaptive = victim(adaptive_in).mean().item()
-        
-        # Check Defense
-        adaptive_raw = adaptive_norm_tensor.cpu().numpy() * self.data_std + self.data_mean
-        score_adaptive, _ = self.detect(adaptive_raw[..., :3])
-        
-        print(f"  Adaptive Attack -> ASR Pred: {pred_adaptive:.2f} | Defense Score: {score_adaptive:.2f}")
+        print(f"{'Lambda':<8} | {'ASR Pred':<10} | {'Def Score':<10} | {'Status'}")
+        print("-" * 50)
 
-        print("\n[Conclusion - Pareto Analysis]")
-        print(f"  Standard: Attack={pred_attack:.2f} (Strong), Defense={score_std:.2f} (Detected)")
-        print(f"  Adaptive: Attack={pred_adaptive:.2f} (Weak),   Defense={score_adaptive:.2f} (Evaded?)")
+        for lam in lambdas:
+            # Reset Generator
+            injector_sweep = BackTimeInjector() 
+            
+            # Train with specific lambda
+            # We use fewer epochs (e.g. 50) to save time, or stick to 100 if fast enough. 
+            # Previous 100 epochs was fast.
+            # Suppress logs for cleanliness, or keep minimal.
+            injector_sweep.train_attack(victim, attack_loader, epochs=50, 
+                                        defense_models=defense_models, lambda_defense=lam, 
+                                        verbose=(lam==100.0)) # Only log detailed loss for high lambda to debug
+            
+            # Eval
+            adapt_norm = injector_sweep.inject_attack(norm_clean_tensor)
+            
+            # ASR
+            adapt_in = adapt_norm[:, :, 0, 0:1]
+            pred_val = victim(adapt_in).mean().item()
+            
+            # Defense
+            adapt_raw = adapt_norm.cpu().numpy() * self.data_std + self.data_mean
+            score_val, _ = self.detect(adapt_raw[..., :3])
+            
+            status = "Detected" if score_val > 3.0 else "Evaded"
+            print(f"{lam:<8.1f} | {pred_val:<10.4f} | {score_val:<10.2f} | {status}")
+            results.append((lam, pred_val, score_val))
+
+        print("\n[Conclusion - Golden Plot Analysis]")
+        # Check trend
+        # We expect: As Lambda increases, Def Score drops, ASR Pred drops.
+        l_0 = results[0] # Lambda 0
+        l_high = results[-1] # Lambda 100
         
-        if score_adaptive < score_std and pred_adaptive < pred_attack:
-             print(">>> PARETO TRADE-OFF VERIFIED: Hiding from defense kills attack effectiveness.")
+        print(f"  Standard (L=0):   Attack={l_0[1]:.2f}, Defense={l_0[2]:.2f}")
+        print(f"  Adaptive (L=100): Attack={l_high[1]:.2f}, Defense={l_high[2]:.2f}")
+        
+        if l_high[1] < l_0[1] and l_high[2] < l_0[2]:
+             print(">>> PARETO TRADE-OFF VERIFIED: Strong Defense Constraint kills Attack.")
+             print(">>> The attacker cannot simultaneously minimize Physical Violation and maximize Harm.")
         else:
-             print(">>> RESULT AMBIGUOUS.")
+             print(">>> Trade-off Unclear. Check gradients.")
 
 if __name__ == "__main__":
     pipeline = DefensePipeline()

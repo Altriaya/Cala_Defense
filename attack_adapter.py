@@ -49,16 +49,18 @@ class BackTimeInjector:
         # Optimizer for Generator
         self.optimizer = torch.optim.Adam(self.generator.parameters(), lr=0.05)
 
-    def train_attack(self, victim_model, data_loader, epochs=100, defense_models=None, lambda_defense=0.0):
+    def train_attack(self, victim_model, data_loader, epochs=100, defense_models=None, lambda_defense=0.0, verbose=True):
         """
         Optimize the generator to fool the victim model AND evade defense.
         
         Args:
             defense_models: dict {'mae': model, 'irm': model} (Optional)
             lambda_defense: weight for defense evasion loss
+            verbose: whether to print epoch logs
         """
         mode_str = "Adaptive" if defense_models else "Standard"
-        print(f"[Attack] Training ({mode_str}) Trigger Generator for {epochs} epochs...")
+        if verbose:
+            print(f"[Attack] Training ({mode_str} L={lambda_defense}) Trigger Generator for {epochs} epochs...")
         self.generator.train()
         victim_model.train()
         
@@ -75,7 +77,7 @@ class BackTimeInjector:
             total_atk_loss = 0
             total_def_loss = 0
             
-            for batch in data_loader:
+            for batch_idx, batch in enumerate(data_loader):
                 # batch: (B, T, N, C) - Normalized
                 
                 # 1. Prepare Attack Input (Node 0)
@@ -137,12 +139,23 @@ class BackTimeInjector:
 
                 self.optimizer.zero_grad()
                 loss.backward()
+                
+                # Gradient Sanity Check
+                if verbose and epoch == 0 and batch_idx == 0 and lambda_defense > 0:
+                    grad_norm = 0.0
+                    for p in self.generator.parameters():
+                        if p.grad is not None:
+                            grad_norm += p.grad.norm().item()
+                    print(f"    [DEBUG] Gradient Norm (L={lambda_defense}): {grad_norm:.6f}")
+                    if grad_norm < 1e-6:
+                        print("    [WARNING] Gradient vanish or detached! Defense might be non-differentiable.")
+                
                 self.optimizer.step()
                 
                 total_loss += loss.item()
                 total_atk_loss += loss_attack.item()
             
-            if epoch % 20 == 0:
+            if verbose and epoch % 10 == 0:
                 def_msg = f" | DefLoss: {total_def_loss:.2f}" if lambda_defense > 0 else ""
                 print(f"  [Attack Epoch {epoch}] Total: {total_loss:.2f} | AtkLoss: {total_atk_loss:.2f}{def_msg}")
                 
