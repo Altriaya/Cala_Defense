@@ -1,0 +1,60 @@
+
+=== EVALUATING DATASET: ETTm1 ===
+[DataLoader] Loaded (69680, 7, 1) from data\ETTm1 (MTS)
+[Pipeline] Profiling and Augmenting...
+[Profiler] Data has < 3 channels. Physical Model Disabled.
+[Pipeline] Data Shape (Raw): (69680, 7, 1) (Physical: False)
+[Pipeline] Sliced Data Shape: (5805, 24, 7, 1)
+[Pipeline] Training MAE (In_Chans=1)...
+Epoch 1/50, Loss: 0.154710
+Epoch 2/50, Loss: 0.108385
+Epoch 3/50, Loss: 0.095971
+Epoch 4/50, Loss: 0.093565
+Epoch 5/50, Loss: 0.089375
+Epoch 6/50, Loss: 0.086189
+Epoch 7/50, Loss: 0.085896
+Epoch 8/50, Loss: 0.084688
+Epoch 9/50, Loss: 0.085662
+Epoch 10/50, Loss: 0.084603
+Epoch 11/50, Loss: 0.082911
+Epoch 12/50, Loss: 0.081461
+Epoch 13/50, Loss: 0.081113
+Epoch 14/50, Loss: 0.079743
+Epoch 15/50, Loss: 0.086372
+Epoch 16/50, Loss: 0.079937
+Epoch 17/50, Loss: 0.079345
+Epoch 18/50, Loss: 0.079704
+Epoch 19/50, Loss: 0.079172
+Epoch 20/50, Loss: 0.078380
+Epoch 21/50, Loss: 0.077517
+Epoch 22/50, Loss: 0.078801
+Epoch 23/50, Loss: 0.078883
+Epoch 24/50, Loss: 0.078862
+Epoch 25/50, Loss: 0.082027
+Epoch 26/50, Loss: 0.078758
+Epoch 27/50, Loss: 0.079710
+Epoch 28/50, Loss: 0.078674
+Epoch 29/50, Loss: 0.078168
+Epoch 30/50, Loss: 0.076969
+Epoch 31/50, Loss: 0.077476
+Epoch 32/50, Loss: 0.082588
+Epoch 33/50, Loss: 0.086092
+Epoch 34/50, Loss: 0.079371
+Epoch 35/50, Loss: 0.076551
+Epoch 36/50, Loss: 0.077595
+Epoch 37/50, Loss: 0.077836
+Epoch 38/50, Loss: 0.077866
+Epoch 39/50, Loss: 0.077114
+Epoch 40/50, Loss: 0.076195
+Epoch 41/50, Loss: 0.076120
+Epoch 42/50, Loss: 0.077912
+Epoch 43/50, Loss: 0.076701
+Epoch 44/50, Loss: 0.075696
+Epoch 45/50, Loss: 0.075667
+Epoch 46/50, Loss: 0.077248
+Epoch 47/50, Loss: 0.077642
+Epoch 48/50, Loss: 0.075056
+Epoch 49/50, Loss: 0.074134
+Epoch 50/50, Loss: 0.074630
+[Pipeline] Training IRM...
+[ERROR] Failed on ETTm1: IRMTrainer.__init__() got an unexpected keyword argument 'hidden_dim'

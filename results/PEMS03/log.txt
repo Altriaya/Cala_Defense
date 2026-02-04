@@ -1,0 +1,8 @@
+
+=== EVALUATING DATASET: PEMS03 ===
+[DataLoader] Loaded (26208, 358, 1) from data\PEMS03 (MTS)
+[Pipeline] Profiling and Augmenting...
+[Profiler] Data has < 3 channels. Physical Model Disabled.
+[Pipeline] Data Shape (Raw): (26208, 358, 1) (Physical: False)
+[Pipeline] Sliced Data Shape: (2183, 24, 358, 1)
+[Pipeline] Training MAE (In_Chans=1)...

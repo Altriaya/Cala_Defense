@@ -1,0 +1,8 @@
+
+=== EVALUATING DATASET: Weather ===
+[DataLoader] Loaded (420551, 14, 1) from data\Weather (MTS)
+[Pipeline] Profiling and Augmenting...
+[Profiler] Data has < 3 channels. Physical Model Disabled.
+[Pipeline] Data Shape: (420551, 14, 1) (Physical: False)
+[Pipeline] Training MAE (In_Chans=1)...
+[ERROR] Failed on Weather: shape '[64, 24, 1]' is invalid for input of size 896

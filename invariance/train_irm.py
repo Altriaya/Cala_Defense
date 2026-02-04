@@ -11,33 +11,39 @@ parent_dir = os.path.dirname(curr_dir)
 sys.path.append(parent_dir)
 
 from utils.mock_data import MockPEMSDataset
-from utils.environment_splitter import EnvironmentSplitter
+from utils.environment_splitter import TimeBasedSplitter
 from utils.physical_augmenter import PhysicalAugmenter
 from invariance.graph_learner import InvariantGraphLearner
 
 class IRMTrainer:
-    def __init__(self, num_nodes=10):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, model=None, device=None, num_nodes=10):
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_nodes = num_nodes
+        self.model = model
         
-        # 1. Prepare Data
-        self.raw_dataset = MockPEMSDataset(num_samples=300, num_nodes=num_nodes, seq_len=24)
-        self.raw_data = self.raw_dataset.get_all_data() # (N, T, Nodes, 3)
-        
-        # Augment
-        self.augmenter = PhysicalAugmenter() # Use defaults for mock
-        self.aug_data = self.augmenter.augment(self.raw_data) # (N, T, Nodes, 4)
-        
-        # 2. Split Environments
-        self.splitter = EnvironmentSplitter(num_envs=3)
-        self.envs_data = self.splitter.split(self.aug_data) # List of np arrays
-        
-        # Convert to Tensors
-        self.envs = [torch.from_numpy(e).float().to(self.device) for e in self.envs_data]
-        
-        # 3. Model
-        self.model = InvariantGraphLearner(num_nodes=num_nodes, in_channels=4).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.005)
+        if self.model:
+             self.model = self.model.to(self.device)
+             self.optimizer = optim.Adam(self.model.parameters(), lr=0.005)
+        else:
+            # Legacy Self-Init
+            # 1. Prepare Data
+            self.raw_dataset = MockPEMSDataset(num_samples=300, num_nodes=num_nodes, seq_len=24)
+            self.raw_data = self.raw_dataset.get_all_data() # (N, T, Nodes, 3)
+            
+            # Augment
+            self.augmenter = PhysicalAugmenter() # Use defaults for mock
+            self.aug_data = self.augmenter.augment(self.raw_data) # (N, T, Nodes, 4)
+            
+            # 2. Split Environments
+            self.splitter = EnvironmentSplitter(num_envs=3)
+            self.envs_data = self.splitter.split(self.aug_data) # List of np arrays
+            
+            # Convert to Tensors
+            self.envs = [torch.from_numpy(e).float().to(self.device) for e in self.envs_data]
+            
+            # 3. Model
+            self.model = InvariantGraphLearner(num_nodes=num_nodes, in_channels=4).to(self.device)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=0.005)
 
     def compute_penalty(self, loss, dummy_w):
         """

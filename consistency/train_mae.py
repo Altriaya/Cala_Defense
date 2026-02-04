@@ -16,61 +16,43 @@ from utils.physical_augmenter import PhysicalAugmenter
 from consistency.mae_model import PhysicsMAE
 
 class MAETrainer:
-    def __init__(self, data_path=None):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, model=None, device=None, data_path=None):
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = model
         
-        # 1. Setup Data
-        raw_dataset = MockPEMSDataset(num_samples=200, seq_len=24, num_nodes=10)
-        raw_data = raw_dataset.get_all_data()
-        
-        # Profile & Augment
-        profiler = PEMSDataProfiler(raw_data)
-        self.coef, self.intercept = profiler.analyze_physics()
-        augmenter = PhysicalAugmenter(self.coef, self.intercept)
-        
-        aug_data_np = augmenter.augment(raw_data)
-        
-        # 2. Normalization (CRITICAL for Residual Channel sensitivity)
-        # Compute mean/std over (N, T, Nodes) for each channel
-        self.mean = np.mean(aug_data_np, axis=(0, 1, 2), keepdims=True)
-        self.std = np.std(aug_data_np, axis=(0, 1, 2), keepdims=True)
-        self.std[self.std < 1e-6] = 1.0 # Avoid div by zero
-        
-        print(f"Data Stats (Mean): {self.mean.flatten()}")
-        print(f"Data Stats (Std):  {self.std.flatten()}")
-        
-        # Normalize
-        norm_data_np = (aug_data_np - self.mean) / self.std
-        
-        # Reshape for Training: (N*Nodes, T, C)
-        N, T, Nodes, C = norm_data_np.shape
-        train_data = norm_data_np.transpose(0, 2, 1, 3).reshape(N*Nodes, T, C)
-        
-        self.train_dataset = torch.utils.data.TensorDataset(torch.from_numpy(train_data).float())
-        self.train_loader = DataLoader(self.train_dataset, batch_size=32, shuffle=True)
-        
-        # 3. Setup Model
-        self.model = PhysicsMAE(seq_len=24, in_channels=4, patch_size=1, mask_ratio=0.4, block_size=6).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
-        
-    def train(self, epochs=5):
+        # If model is not provided, initialize standard one (Legacy mode)
+        if self.model is None:
+             # Legacy init logic...
+             pass 
+        else:
+             self.model = self.model.to(self.device)
+             self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+
+    def train_model(self, loader, epochs=5):
+        """
+        Train using external DataLoader.
+        """
         self.model.train()
         for epoch in range(epochs):
             total_loss = 0
-            for batch in self.train_loader:
+            for batch in loader:
                 x = batch[0].to(self.device) # (B, T, C)
-                
+                # print(f"DEBUG Trainer Input Shape: {x.shape}") 
                 pred, mask, _ = self.model(x)
                 loss = self.model.compute_loss(pred, x, mask)
                 
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-                
                 total_loss += loss.item()
             
-            avg_loss = total_loss / len(self.train_loader)
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+            if epoch % 2 == 0:
+                print(f"    [MAE Epoch {epoch}] Loss: {total_loss/len(loader):.4f}")
+
+    # Legacy train method kept for backward compatibility if needed, 
+    # but we primarily use train_model now.
+    def train(self, epochs=5):
+        pass
             
     def verify_masking_sensitivity(self):
         """

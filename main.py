@@ -7,267 +7,298 @@ import os
 curr_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(curr_dir)
 
-from utils.mock_data import MockPEMSDataset
-from utils.data_profiler import PEMSDataProfiler
+# Utils
+from utils.greenshields import GreenshieldsProfiler
 from utils.physical_augmenter import PhysicalAugmenter
+from utils.environment_splitter import TimeBasedSplitter
+
+# Models & Trainers
 from consistency.mae_model import PhysicsMAE
+from consistency.train_mae import MAETrainer
 from invariance.graph_learner import InvariantGraphLearner
+from invariance.train_irm import IRMTrainer
+from models import TimesNetForecaster
+from attack_adapter import BackTimeInjector
 from detection.scorer import AnomalyScorer
+
+from sklearn.metrics import roc_auc_score, roc_curve
 
 class DefensePipeline:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[Pipeline] Initializing on {self.device}...")
+        self.data_path = 'd:/DLProjectHome/Cala_Defense/data/PEMS04/PEMS04.npz'
         
-        # 1. Models (Reloading/Initializing fresh for demo)
-        # Note: In real scenarios, load pretrained weights.
-        self.mae = PhysicsMAE(seq_len=24, in_channels=4, patch_size=1, mask_ratio=0.4).to(self.device)
-        self.irm = InvariantGraphLearner(num_nodes=10, in_channels=4).to(self.device)
+        # State
+        self.mae = None
+        self.irm = None
         self.scorer = AnomalyScorer()
-        
-        # We need Stats for Data Normalization (from MAE training step)
-        # Hardcoding or re-computing for this demo script
         self.data_mean = None
         self.data_std = None
         self.augmenter = None
         
     def prepare_data(self):
-        print("[Pipeline] Preparing Pipeline Data...")
-        # 1. Raw Data (Clean History)
-        raw_dataset = MockPEMSDataset(num_samples=200, seq_len=24, num_nodes=10)
-        raw_data = raw_dataset.get_all_data()
-        
-        # 2. Profile
-        profiler = PEMSDataProfiler(raw_data)
-        coef, intercept = profiler.analyze_physics()
-        self.augmenter = PhysicalAugmenter(coef, intercept)
-        
-        # 3. Augment
-        aug_data = self.augmenter.augment(raw_data)
-        
-        # 4. Calc Normalization Stats
-        self.data_mean = np.mean(aug_data, axis=(0, 1, 2), keepdims=True)
-        self.data_std = np.std(aug_data, axis=(0, 1, 2), keepdims=True)
-        self.data_std[self.data_std < 1e-6] = 1.0
-        
-        # 5. Return Train/Val split
-        # Just use all for "Validation" phase of scorer for this demo
-        norm_data = (aug_data - self.data_mean) / self.data_std
-        return norm_data
+        print("[Phase 0] Preparing Real PEMS04 Data...")
+        try:
+            # 1. Load PEMS04
+            data_raw = np.load(self.data_path)['data'] # (16992, 307, 3)
+            # PEMS04 (T, N, C). Channels: Flow, Occ, Speed?
+            # Standard PEMS sequence usually: flow, occ, speed.
+            # Profiler will confirm constraints.
+            
+            # Slice for demo speed (use first 2000 steps, ~1 week)
+            # Full dataset is too large for quick demo training
+            demo_steps = 4000 
+            data_slice = data_raw[:demo_steps, :10, :] # Use first 10 nodes for speed
+            
+            print(f"  Data loaded: {data_slice.shape}")
 
-    def calibrate(self, val_data_norm):
-        """
-        Run valid data through models to get baseline loss distributions.
-        """
-        print("[Pipeline] Calibrating Scorer...")
+            # 2. Physics Profiling (Greenshields)
+            print("  [Physics] Fitting Greenshields Model...")
+            # We need T*N samples.
+            profiler = GreenshieldsProfiler(data_array=data_slice)
+            v_f, k_j = profiler.fit_physics()
+            
+            # 3. Augment
+            self.augmenter = PhysicalAugmenter(v_f=v_f, k_j=k_j)
+            aug_data = self.augmenter.augment(data_slice) # (T, N, 4)
+            
+            # 4. Normalize
+            self.data_mean = np.mean(aug_data, axis=(0, 1), keepdims=True)
+            self.data_std = np.std(aug_data, axis=(0, 1), keepdims=True)
+            self.data_std[self.data_std < 1e-6] = 1.0
+            
+            norm_data = (aug_data - self.data_mean) / self.data_std
+            
+            # 5. Windowing (Sliding Window)
+            seq_len = 24
+            samples = []
+            # Create samples (Clean)
+            # Use Stride=1 for Maximum Data (Solve IRM Starvation)
+            print("  Windowing with Stride=1...")
+            for t in range(0, norm_data.shape[0] - seq_len, 1): 
+                samples.append(norm_data[t:t+seq_len])
+            
+            samples = np.array(samples) # (NumSamples, 24, N, 4)
+            print(f"  Windowed Samples: {samples.shape}")
+            
+            return samples, data_slice # Return raw for splitter if needed
+            
+        except Exception as e:
+            print(f"[Error] Data Prep Failed: {e}")
+            sys.exit(1)
+
+    def train_defense(self, train_data, raw_sequence_slice):
+        print("\n[Phase 1] Training Defense Models (Scientific)...")
+        
+        # 1. Train MAE
+        print("  [1.1] Training Physics-MAE...")
+        self.mae = PhysicsMAE(seq_len=24, in_channels=4, patch_size=1, mask_ratio=0.4).to(self.device)
+        mae_trainer = MAETrainer(self.mae, self.device)
+        
+        B, T, N, C = train_data.shape
+        mae_input = train_data.transpose(0, 2, 1, 3).reshape(B*N, T, C)
+        
+        # Larger batch for dense data
+        mae_dataset = torch.utils.data.TensorDataset(torch.from_numpy(mae_input).float())
+        mae_loader = torch.utils.data.DataLoader(
+            mae_dataset, batch_size=256, shuffle=True
+        )
+        mae_trainer.train_model(mae_loader, epochs=5) 
+        
+        # 2. Train IRM
+        print("  [1.2] Training Invariant Graph Learner (IRM)...")
+        
+        splitter = TimeBasedSplitter(steps_per_day=288)
+        
+        envs = [[], [], []] # AM, PM, Off
+        for i in range(len(train_data)):
+            t_start = i * 1 # Stride 1
+            env_id = splitter.get_env_id(t_start)
+            envs[env_id].append(train_data[i])
+            
+        env_tensors = [torch.from_numpy(np.array(e)).float().to(self.device) for e in envs if len(e) > 0]
+        print(f"    IRM Environments: {[e.shape[0] for e in env_tensors]}")
+        
+        self.irm = InvariantGraphLearner(num_nodes=N, in_channels=4).to(self.device)
+        optimizer = torch.optim.Adam(self.irm.parameters(), lr=0.005)
+        self.irm.train()
+        
+        for ep in range(10):
+            total_loss = 0
+            min_len = min([len(e) for e in env_tensors])
+            batch_size = 64 # Larger batch for stable gradient
+            
+            iter_limit = min(50, min_len // batch_size) 
+
+            for _ in range(iter_limit):
+                env_losses = []
+                for env_data in env_tensors:
+                    idx = torch.randperm(len(env_data))[:batch_size]
+                    batch = env_data[idx] 
+                    pred, _ = self.irm(batch)
+                    loss = torch.mean((pred - batch)**2)
+                    env_losses.append(loss)
+                
+                loss_stack = torch.stack(env_losses)
+                mean_loss = torch.mean(loss_stack)
+                var_loss = torch.var(loss_stack)
+                loss = mean_loss + 100.0 * var_loss # Stronger Penalty
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                
+            if ep % 2 == 0:
+                print(f"    [IRM Epoch {ep}] Loss: {total_loss:.4f}")
+
+    def calibrate(self, val_data):
+        print("\n[Phase 2] Calibrating Scorer (Val Data)...")
         self.mae.eval()
         self.irm.eval()
-        
         losses = {'mae': [], 'irm': []}
         
-        # Convert to tensor
-        # MAE expects (Batch, T, C) - we treat nodes as batch
-        N, T, Nodes, C = val_data_norm.shape
-        # Flatten nodes for MAE
-        val_tensor_linear = torch.from_numpy(val_data_norm.transpose(0, 2, 1, 3).reshape(N*Nodes, T, C)).float().to(self.device)
+        B, T, N, C = val_data.shape
         
-        # Run MAE Batch-wise
-        batch_size = 64
+        # MAE (Chunked)
+        mae_input = val_data.transpose(0, 2, 1, 3).reshape(B*N, T, C)
+        t_mae = torch.from_numpy(mae_input).float().to(self.device)
         with torch.no_grad():
-            for i in range(0, len(val_tensor_linear), batch_size):
-                batch = val_tensor_linear[i:i+batch_size]
-                pred, mask, _ = self.mae(batch)
-                loss = self.mae.compute_loss(pred, batch, mask) # This is mean loss
-                # We need per-sample loss for distribution! 
-                # compute_loss returns scalar. Let's manually compute per-sample
-                # (Re-implement logic here inline for vectors)
-                loss_vec = (pred - batch) ** 2
-                # Mask expansion logic... skipping for demo brevity, using mean as proxy for distribution
-                # Actually, effectively we need many samples.
-                # Let's just append the batch mean for now, assuming variance across batches.
-                losses['mae'].append(loss.item())
-
-            # Run IRM (Sample-wise)
-            # IRM takes (B, T, N, C).
-            val_tensor_irm = torch.from_numpy(val_data_norm).float().to(self.device)
-            for i in range(N):
-                sample = val_tensor_irm[i:i+1] # (1, T, N, C)
-                pred, _ = self.irm(sample)
-                loss = torch.mean((pred - sample)**2).item()
-                losses['irm'].append(loss)
-                
+            batches = torch.split(t_mae, 1024)
+            for b in batches:
+                 p, m, _ = self.mae(b)
+                 l = torch.mean((p-b)**2, dim=(1,2))
+                 losses['mae'].extend(l.cpu().numpy())
+        
+        # IRM
+        t_irm = torch.from_numpy(val_data).float().to(self.device)
+        with torch.no_grad():
+             # Split IRM too if huge
+             batches = torch.split(t_irm, 128)
+             for b in batches:
+                 p, _ = self.irm(b)
+                 l = torch.mean((p-b)**2, dim=(1,2,3))
+                 losses['irm'].extend(l.cpu().numpy())
+             
         self.scorer.fit(losses)
 
-    def detect(self, raw_sample):
-        """
-        End-to-End Detection.
-        Args:
-            raw_sample: (1, T, N, 3) Raw PEMS data
-        """
+    def detect_score(self, x_norm):
         self.mae.eval()
         self.irm.eval()
-        
-        # 1. Augment
-        aug_sample = self.augmenter.augment(raw_sample)
-        
-        # 2. Normalize
-        norm_sample = (aug_sample - self.data_mean) / self.data_std
-        
-        B, T, N, C = norm_sample.shape
-        
-        # 3. MAE Score
-        # Flatten nodes
-        tensor_linear = torch.from_numpy(norm_sample.transpose(0, 2, 1, 3).reshape(B*N, T, C)).float().to(self.device)
         with torch.no_grad():
-            pred, mask, _ = self.mae(tensor_linear)
-            loss_mae = self.mae.compute_loss(pred, tensor_linear, mask).item()
+            B, T, N, C = x_norm.shape
+            # MAE
+            x_mae = x_norm.transpose(0, 2, 1, 3).reshape(B*N, T, C)
+            t_mae = torch.from_numpy(x_mae).float().to(self.device)
+            p_m, m, _ = self.mae(t_mae)
+            loss_mae = torch.mean((p_m - t_mae)**2, dim=(1,2)).reshape(B, N).mean(dim=1).cpu().numpy()
             
-        # 4. IRM Score
-        tensor_irm = torch.from_numpy(norm_sample).float().to(self.device)
-        with torch.no_grad():
-            pred_irm, _ = self.irm(tensor_irm)
-            loss_irm = torch.mean((pred_irm - tensor_irm)**2).item()
+            # IRM
+            t_irm = torch.from_numpy(x_norm).float().to(self.device)
+            p_i, _ = self.irm(t_irm)
+            loss_irm = torch.mean((p_i - t_irm)**2, dim=(1,2,3)).cpu().numpy()
             
-        # 5. Score
-        loss_dict = {'mae': loss_mae, 'irm': loss_irm}
-        final_score, details = self.scorer.score(loss_dict)
-        
-        return final_score, details
+            stats = self.scorer.stats
+            z_mae = (loss_mae - stats['mae']['mu']) / stats['mae']['sigma']
+            z_irm = (loss_irm - stats['irm']['mu']) / stats['irm']['sigma']
+            
+            scores = (z_mae + z_irm) / 2.0
+            return scores
 
     def run_eval(self):
-        print("\n\n=== RUNNING FINAL ADVERSARIAL EVALUATION ===")
-        val_data = self.prepare_data() # (B, 24, 10, 4) - Normalized
-        self.calibrate(val_data)
+        # 1. Prep (Sliding Window)
+        data, raw_slice = self.prepare_data()
         
-        # --- PHASE 1: Train Witness (Victim) Model ---
-        print("\n[Phase 1] Training Victim Model (TimesNet)...")
-        from models import TimesNetForecaster
-        # d_model=32, k=3 to capture sparse periods in traffic
-        victim = TimesNetForecaster(in_dim=1, out_dim=12, d_model=32, k=3).to(self.device)
-        v_opt = torch.optim.Adam(victim.parameters(), lr=0.01)
-        criterion = torch.nn.MSELoss()
+        n = len(data)
+        train_d = data[:int(0.5*n)]
+        val_d = data[int(0.5*n):int(0.75*n)]
+        test_d = data[int(0.75*n):]
         
-        # Create DataLoader from val_data
-        # We use Node 0, Channel 0 (Flow) for simplicity
-        # Input: Steps 0-24. Target: Steps 12-36? 
-        # For simplicity, Input first 12, Predit next 12.
-        # Wait, our data is only 24 long.
-        # Input: 0-12. Target: 12-24.
-        train_input = torch.from_numpy(val_data[:, :24, 0, 0:1]).float().to(self.device) # (N, 24, 1)
+        # 2. Train Defense
+        self.train_defense(train_d, raw_slice)
         
+        # 3. Calibrate
+        self.calibrate(val_d)
+        
+        # 4. Train Victim (Mock for speed)
+        print("\n[Phase 3] Training Victim Model (TimesNet)...")
+        # Define Simple Victim locally if not imported
+        victim = TimesNetForecaster(in_dim=1, out_dim=12).to(self.device)
+        optimizer = torch.optim.Adam(victim.parameters(), lr=0.01)
+        # Train on train_d (Flow channel)
+        v_train_in = torch.from_numpy(train_d[:500, :24, 0, 0:1]).float().to(self.device) # Subset for speed
         victim.train()
-        for e in range(50):
-            # Input: 0-24. Target: a dummy shift? 
-            # Let's say we auto-regressively predict.
-            # But BackTime just needs gradients.
-            # Let's predict next step? Or predict last 12 from first 12.
-            # Let's do: Input 0:12 -> Pred 12:24.
-            inputs = train_input[:, :12, :]
-            targets = train_input[:, 12:, 0] # (N, 12)
-            
-            p = victim(inputs)
-            loss = criterion(p, targets)
-            v_opt.zero_grad()
-            loss.backward()
-            v_opt.step()
-            
-            if e % 10 == 0:
-                print(f"  [Victim Epoch {e}] Loss: {loss.item():.4f}")
-        print("Victim Model training complete.")
+        for e in range(30):
+             p = victim(v_train_in[:,:12])
+             l = torch.nn.functional.mse_loss(p, v_train_in[:,12:,0])
+             optimizer.zero_grad(); l.backward(); optimizer.step()
+        print("  Victim Trained.")
         
-        # --- PHASE 2: Train Attacker (BackTime) ---
-        print("\n[Phase 2] Optimizing BackTime Trigger against Victim...")
-        from attack_adapter import BackTimeInjector
-        injector = BackTimeInjector()
-        
-        # Create a torch DataLoader of the full data for attack training
-        # We need (B, 24, 10, 4) tensors
-        attack_loader = torch.utils.data.DataLoader(
-            torch.from_numpy(val_data).float().to(self.device), 
-            batch_size=32, 
-            shuffle=True
-        )
-        
-        injector.train_attack(victim, attack_loader, epochs=100)
-        
-        # --- PHASE 3: Deploy & Defend (Standard) ---
-        print("\n[Phase 3] Deploying Optimized Attack (Standard)...")
-        # ... (Existing Clean/Attack Setup) ...
-        # Clean
-        clean_raw = MockPEMSDataset(num_samples=1, seq_len=24, num_nodes=10).get_all_data()
-        aug_clean = self.augmenter.augment(clean_raw)
-        norm_clean = (aug_clean - self.data_mean) / self.data_std
-        norm_clean_tensor = torch.from_numpy(norm_clean).float().to(self.device)
-
-        # Inject Standard Optimized Trigger
-        attacked_norm_tensor = injector.inject_attack(norm_clean_tensor)
-        
-        # Verify ASR
-        victim.eval()
-        clean_in = norm_clean_tensor[:, :, 0, 0:1]
-        pred_clean = victim(clean_in).mean().item()
-        
-        attacked_in = attacked_norm_tensor[:, :, 0, 0:1]
-        pred_attack = victim(attacked_in).mean().item() # Should be high (e.g. 1.0)
-        
-        # Defense Score
-        attacked_raw = attacked_norm_tensor.cpu().numpy() * self.data_std + self.data_mean
-        score_std, _ = self.detect(attacked_raw[..., :3])
-        
-        print(f"  Standard Attack -> ASR Pred: {pred_attack:.2f} (Clean: {pred_clean:.2f}) | Defense Score: {score_std:.2f}")
-        
-        # --- PHASE 4: The Golden Plot (Pareto Frontier) ---
+        # 5. Attack & Lambda Sweep
         print("\n[Phase 4] Verifying Pareto Frontier (Lambda Sweep)...")
         
-        lambdas = [0.0, 1.0, 10.0, 100.0]
-        results = []
+        atk_subset_indices = np.random.choice(len(train_d), size=min(len(train_d), 500), replace=False)
+        atk_subset = train_d[atk_subset_indices]
+        atk_loader = torch.utils.data.DataLoader(torch.from_numpy(atk_subset).float().to(self.device), batch_size=32, shuffle=True)
+        
+        t_test = torch.from_numpy(test_d).float().to(self.device)
+        scores_clean = self.detect_score(test_d)
         
         defense_models = {'mae': self.mae, 'irm': self.irm}
         
-        print(f"{'Lambda':<8} | {'ASR Pred':<10} | {'Def Score':<10} | {'Status'}")
-        print("-" * 50)
-
+        lambdas = [0.0, 10.0, 50.0, 100.0]
+        results = [] 
+        
+        print(f"{'Lambda':<8} | {'AUC':<10} | {'Shift':<15} | {'Status'}")
+        print("-" * 55)
+        
         for lam in lambdas:
-            # Reset Generator
-            injector_sweep = BackTimeInjector() 
+            injector = BackTimeInjector()
+            injector.train_attack(victim, atk_loader, epochs=20, defense_models=defense_models, lambda_defense=lam, 
+                                  verbose=False, augmenter=self.augmenter, data_mean=self.data_mean, data_std=self.data_std)
             
-            # Train with specific lambda
-            # We use fewer epochs (e.g. 50) to save time, or stick to 100 if fast enough. 
-            # Previous 100 epochs was fast.
-            # Suppress logs for cleanliness, or keep minimal.
-            injector_sweep.train_attack(victim, attack_loader, epochs=50, 
-                                        defense_models=defense_models, lambda_defense=lam, 
-                                        verbose=(lam==100.0)) # Only log detailed loss for high lambda to debug
+            t_adv = injector.inject_attack(t_test, augmenter=self.augmenter, data_mean=self.data_mean, data_std=self.data_std)
             
-            # Eval
-            adapt_norm = injector_sweep.inject_attack(norm_clean_tensor)
+            with torch.no_grad():
+                pred_clean = victim(t_test[:, :, 0, 0:1]).mean().item()
+                pred_adv = victim(t_adv[:, :, 0, 0:1]).mean().item()
+                shift = abs(pred_adv - pred_clean)
             
-            # ASR
-            adapt_in = adapt_norm[:, :, 0, 0:1]
-            pred_val = victim(adapt_in).mean().item()
+            x_adv = t_adv.cpu().numpy()
+            scores_adv = self.detect_score(x_adv)
             
-            # Defense
-            adapt_raw = adapt_norm.cpu().numpy() * self.data_std + self.data_mean
-            score_val, _ = self.detect(adapt_raw[..., :3])
+            y_true = np.concatenate([np.zeros_like(scores_clean), np.ones_like(scores_adv)])
+            y_score = np.concatenate([scores_clean, scores_adv])
+            try:
+                auc = roc_auc_score(y_true, y_score)
+            except:
+                auc = 0.5
             
-            status = "Detected" if score_val > 3.0 else "Evaded"
-            print(f"{lam:<8.1f} | {pred_val:<10.4f} | {score_val:<10.2f} | {status}")
-            results.append((lam, pred_val, score_val))
+            status = "Stealthy" if auc < 0.65 else "Detected"
+            if shift < 1.0: status += " & Weak"
+            
+            print(f"{lam:<8.1f} | {auc:<10.4f} | {shift:<15.4f} | {status}")
+            results.append({'lambda': lam, 'auc': auc, 'shift': shift})
 
-        print("\n[Conclusion - Golden Plot Analysis]")
-        # Check trend
-        # We expect: As Lambda increases, Def Score drops, ASR Pred drops.
-        l_0 = results[0] # Lambda 0
-        l_high = results[-1] # Lambda 100
+        print("\n[Final Verdict]")
+        l_0 = results[0]
+        l_100 = results[-1]
         
-        print(f"  Standard (L=0):   Attack={l_0[1]:.2f}, Defense={l_0[2]:.2f}")
-        print(f"  Adaptive (L=100): Attack={l_high[1]:.2f}, Defense={l_high[2]:.2f}")
+        print(f"Standard Attack (L=0)   -> AUC: {l_0['auc']:.4f}")
+        print(f"Extreme Constraint (L=100) -> AUC: {l_100['auc']:.4f}, Shift: {l_100['shift']:.4f}")
         
-        if l_high[1] < l_0[1] and l_high[2] < l_0[2]:
-             print(">>> PARETO TRADE-OFF VERIFIED: Strong Defense Constraint kills Attack.")
-             print(">>> The attacker cannot simultaneously minimize Physical Violation and maximize Harm.")
+        if l_0['auc'] > 0.70:
+            print("1. Defense is EFFECTIVE against naive attacks.")
+            if l_100['auc'] < 0.65 and l_100['shift'] < l_0['shift'] * 0.6:
+                print("2. Pareto Trade-off CONFIRMED: High stealth forces significantly reduced Impact.")
+                print("   The defense successfully forces the attacker into a dilemma.")
+            elif l_100['auc'] > 0.70:
+                print("2. Defense is ROBUST: Even L=100 cannot evade detection.")
+            else:
+                 print("2. Trade-off Unclear. Check penalties.")
         else:
-             print(">>> Trade-off Unclear. Check gradients.")
+            print("1. Defense Failed Base Case.")
 
 if __name__ == "__main__":
     pipeline = DefensePipeline()

@@ -1,0 +1,5 @@
+Dataset: ETTm1
+Physical: False
+Clean Score: 466.40
+Anomaly Score: 1649.05
+Details: {'mae': 1649.053298808404, 'irm': 178.1368080533238}

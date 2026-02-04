@@ -49,14 +49,26 @@ class BackTimeInjector:
         # Optimizer for Generator
         self.optimizer = torch.optim.Adam(self.generator.parameters(), lr=0.05)
 
-    def train_attack(self, victim_model, data_loader, epochs=100, defense_models=None, lambda_defense=0.0, verbose=True):
+    def enforce_physics(self, batch_norm, augmenter, mean, std):
+        """
+        Re-calculates the Physics Residual channel (Channel 3) based on modified Flow/Speed/Occ.
+        Differentiable.
+        """
+        # batch_norm: (..., 4)
+        # 1. Denormalize First 3 Channels (Flow, Occ, Speed)
+        raw_core = batch_norm[..., :3] * std[..., :3] + mean[..., :3]
+        
+        # 2. Augment (Calculate Residual)
+        aug_raw = augmenter.augment(raw_core)
+        
+        # 3. Normalize
+        norm_new = (aug_raw - mean) / std
+        return norm_new
+
+    def train_attack(self, victim_model, data_loader, epochs=100, defense_models=None, lambda_defense=0.0, 
+                     verbose=True, augmenter=None, data_mean=None, data_std=None):
         """
         Optimize the generator to fool the victim model AND evade defense.
-        
-        Args:
-            defense_models: dict {'mae': model, 'irm': model} (Optional)
-            lambda_defense: weight for defense evasion loss
-            verbose: whether to print epoch logs
         """
         mode_str = "Adaptive" if defense_models else "Standard"
         if verbose:
@@ -64,13 +76,17 @@ class BackTimeInjector:
         self.generator.train()
         victim_model.train()
         
-        # If adaptive, set defense models to eval
         if defense_models:
             if 'mae' in defense_models: defense_models['mae'].eval()
             if 'irm' in defense_models: defense_models['irm'].eval()
 
         target_val = 5.0 
         target_tensor = torch.full((1, 12), target_val).to(self.device)
+        
+        # Convert stats to tensor if needed
+        if data_mean is not None:
+             t_mean = torch.from_numpy(data_mean).float().to(self.device)
+             t_std = torch.from_numpy(data_std).float().to(self.device)
         
         for epoch in range(epochs):
             total_loss = 0
@@ -85,15 +101,18 @@ class BackTimeInjector:
                 
                 # 2. Generate Trigger
                 trigger_seq, perturb = self.generator(context)
-                trigger_vals = trigger_seq.view(-1, 12)
+                trigger_vals = trigger_seq.view(batch.shape[0], 12)
                 
                 # 3. Inject Trigger 
-                # We need full batch for Defense models
                 attacked_batch = batch.clone()
-                # Inject into Node 0, Channel 0, steps 12:24
                 attacked_batch[:, 12:, 0, 0] = trigger_vals
                 
-                # 4. Victim Forward (uses Node 0 Flow)
+                # --- PHYSICS CONSISTENCY ---
+                if augmenter and data_mean is not None:
+                    attacked_batch = self.enforce_physics(attacked_batch, augmenter, t_mean, t_std)
+                # ---------------------------
+                
+                # 4. Victim Forward
                 attacked_input_flow = attacked_batch[:, :, 0, 0]
                 victim_in = attacked_input_flow.unsqueeze(-1)
                 pred = victim_model(victim_in)
@@ -107,49 +126,25 @@ class BackTimeInjector:
                 # 6. Adaptive Defense Loss
                 if defense_models and lambda_defense > 0:
                     loss_evade = 0
-                    
-                    # MAE Loss
                     if 'mae' in defense_models:
                         mae = defense_models['mae']
-                        # MAE expects (N*B, T, C). Flatten nodes.
                         B, T, N, C = attacked_batch.shape
                         flat_input = attacked_batch.transpose(1, 2).reshape(B*N, T, C)
-                        # We only care about Node 0, but MAE processes all. 
-                        # Optimization is efficiently propagated through Node 0 part.
-                        
-                        # MAE Forward
-                        # We need 'pred' from MAE.
                         mae_pred, mask, _ = mae(flat_input)
-                        # Loss is MSE(pred, input)
-                        # We want to Minimize this reconstruction error (to look "Normal")
                         loss_mae = torch.mean((mae_pred - flat_input)**2)
                         loss_evade += loss_mae
                         
-                    # IRM Loss
                     if 'irm' in defense_models:
                         irm = defense_models['irm']
-                        # IRM expects (B, T, N, C) -> (pred, adj)
                         irm_pred, _ = irm(attacked_batch)
                         loss_irm = torch.mean((irm_pred - attacked_batch)**2)
                         loss_evade += loss_irm
                         
-                    # Add to total loss
                     loss += lambda_defense * loss_evade
                     total_def_loss += loss_evade.item()
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                
-                # Gradient Sanity Check
-                if verbose and epoch == 0 and batch_idx == 0 and lambda_defense > 0:
-                    grad_norm = 0.0
-                    for p in self.generator.parameters():
-                        if p.grad is not None:
-                            grad_norm += p.grad.norm().item()
-                    print(f"    [DEBUG] Gradient Norm (L={lambda_defense}): {grad_norm:.6f}")
-                    if grad_norm < 1e-6:
-                        print("    [WARNING] Gradient vanish or detached! Defense might be non-differentiable.")
-                
                 self.optimizer.step()
                 
                 total_loss += loss.item()
@@ -161,7 +156,7 @@ class BackTimeInjector:
                 
         self.generator.eval()
 
-    def inject_attack(self, data_norm):
+    def inject_attack(self, data_norm, augmenter=None, data_mean=None, data_std=None):
         """
         Injects BackTime trigger into the data.
         Args:
@@ -169,32 +164,27 @@ class BackTimeInjector:
         Returns:
             attacked_data: (1, T, N, C)
         """
-        # Data is (B, T, N, C).
-        # TgrGCN expects input (B, input_dim). 
-        # input_dim = bef_tgr_len.
-        
-        # Let's say we attack the last 12 steps (trigger_len).
-        # We use the first 12 steps as context (bef_tgr_len).
-        
-        # B=1
-        context = data_norm[:, :12, 0, 0] # Use Node 0, Channel 0 (Flow), first 12 steps
-        # Shape (1, 12).
-        
-        # Generator forward
-        # x: (batch, input_dim) -> (batch, trigger_len)
+        # B=1 or N
+        context = data_norm[:, :12, 0, 0] 
         with torch.no_grad():
-            # TgrGCN output_dim is trigger_len.
             trigger_seq, _ = self.generator(context) 
             
-        trigger_vals = trigger_seq.view(1, 12)
-        
-        # Scale no longer needed if we trained it in the normalized space!
-        # It should have learned the scale required to fool the victim.
+        trigger_vals = trigger_seq.view(data_norm.shape[0], 12)
         
         # Inject
         attacked_data = data_norm.clone()
-        # Inject into Node 0, Channel 0, steps 12:24
         attacked_data[:, 12:, 0, 0] = trigger_vals
+        
+        # Update Physics
+        if augmenter and data_mean is not None:
+             if isinstance(data_mean, np.ndarray):
+                 t_mean = torch.from_numpy(data_mean).float().to(self.device)
+                 t_std = torch.from_numpy(data_std).float().to(self.device)
+             else:
+                 t_mean = data_mean
+                 t_std = data_std
+                 
+             attacked_data = self.enforce_physics(attacked_data, augmenter, t_mean, t_std)
         
         return attacked_data
 

@@ -1,0 +1,9 @@
+
+=== EVALUATING DATASET: PEMS08 ===
+[DataLoader] Loaded (17856, 170, 3) from data\PEMS08 (PEMS)
+[Pipeline] Profiling and Augmenting...
+[Profiler] Physics Model: Flow = 55.0135 * (Speed * Occ) + 15.0555
+[Profiler] R2 Score: 0.6351
+[Pipeline] Data Shape: (17856, 170, 4) (Physical: True)
+[Pipeline] Training MAE (In_Chans=4)...
+[ERROR] Failed on PEMS08: shape '[64, 24, 4]' is invalid for input of size 43520
