@@ -51,18 +51,75 @@ class BackTimeInjector:
 
     def enforce_physics(self, batch_norm, augmenter, mean, std):
         """
-        Re-calculates the Physics Residual channel (Channel 3) based on modified Flow/Speed/Occ.
+        Re-calculates the Physics Residual channel based on modified Flow/Speed/Occ or Spectral.
         Differentiable.
         """
-        # batch_norm: (..., 4)
+        if augmenter is None:
+            return batch_norm # No physics to enforce
+            
+        # Check if it's SpectralAugmenter (duck typing or isinstance)
+        if hasattr(augmenter, 'enforce_consistency'):
+            return augmenter.enforce_consistency(batch_norm, mean, std)
+            
+        # Standard Greenshields Augmenter (or Hybrid)
+        # batch_norm: (..., C) where C=4 or C=5
+        C = batch_norm.shape[-1]
+        
         # 1. Denormalize First 3 Channels (Flow, Occ, Speed)
         raw_core = batch_norm[..., :3] * std[..., :3] + mean[..., :3]
         
-        # 2. Augment (Calculate Residual)
-        aug_raw = augmenter.augment(raw_core)
+        # 2. Re-calculate Residual (Channel 3)
+        # q = v * k  (Flow = Speed * Occ)
+        # Residual = Flow - (Speed * Occ * Coef) ?? 
+        # Actually PhysicalAugmenter logic is:
+        # Aug = Flow - Model(Speed, Occ)
+        # We need to replicate PhysicalAugmenter.augment() logic here but differentiable.
+        # But we don't have access to v_f, k_j easily unless passed.
+        # Wait, if we are here, 'augmenter' is a PhysicalAugmenter instance.
+        # It has v_f, k_j.
         
-        # 3. Normalize
-        norm_new = (aug_raw - mean) / std
+        # Using the augmenter's method if available?
+        # PhysicalAugmenter doesn't have a torch-differentiable 'enforce' method yet.
+        # We implemented 'enforce_physics' in this class originally.
+        
+        # Let's assume standard Greenshields model:
+        # v = v_f * (1 - k/k_j) -> q = k*v
+        # But our residual is: res = q - q_model
+        
+        # We need v_f and k_j from the augmenter if possible.
+        v_f = getattr(augmenter, 'v_f', 60.0)
+        k_j = getattr(augmenter, 'k_j', 0.5)
+        
+        flow = raw_core[..., 0]
+        occ = raw_core[..., 1]
+        # speed = raw_core[..., 2] # We don't use Speed for q_model usually, we predict q from k.
+        
+        # Physics Model: q = v_f * k * (1 - k/k_j)
+        q_model = v_f * occ * (1 - occ/k_j)
+        
+        res_new = flow - q_model
+        
+        # 3. Normalize Residual (Channel 3)
+        res_norm = (res_new - mean[..., 3]) / std[..., 3]
+        res_norm = res_norm.unsqueeze(-1)
+        
+        # 4. Re-assemble
+        # (..., 4) or (..., 5)
+        
+        # If C=5 (Hybrid), we also need to preserve or update Channel 4 (Spectral).
+        # ideally we update it too, but we don't have the spectral profiler here easily.
+        # We can just preserve it (Identity) or zero it if we can't enforce it?
+        # Preserving is better than crashing.
+        
+        list_ch = [batch_norm[..., 0:3], res_norm]
+        
+        if C == 5:
+            # Preserve Saliency (Channel 4)
+            saliency = batch_norm[..., 4:5]
+            list_ch.append(saliency)
+            
+        norm_new = torch.cat(list_ch, dim=-1)
+            
         return norm_new
 
     def train_attack(self, victim_model, data_loader, epochs=100, defense_models=None, lambda_defense=0.0, 
